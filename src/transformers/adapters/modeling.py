@@ -36,6 +36,8 @@ class BertActivation(nn.Module):
             torchscript: bool=False
             type_vocab_size: int=1
             vocab_size: int=50265
+            chunk_size_feed_forward: int=0
+            add_cross_attention: bool=False
 
         self.adapter_config = AdapterConfig
         self.encoder = BertEncoder(self.adapter_config)
@@ -43,16 +45,16 @@ class BertActivation(nn.Module):
     def forward(self, x):
         # From K-Adapters original code
         input_shape = x.size()[:-1]
-        attention_mask = torch.ones(input_shape, device=torch.device("cpu"))
+        attention_mask = torch.ones(input_shape, device=x.device)
         if attention_mask.dim() == 3:
             extended_attention_mask = attention_mask[:, None, :, :]
 
         if attention_mask.dim() == 2:
             extended_attention_mask = attention_mask[:, None, None, :]
 
-        extended_attention_mask = extended_attention_mask.to(
-            dtype=next(self.parameters()).dtype
-        )  # fp16 compatibility
+        # extended_attention_mask = extended_attention_mask.to(
+        #     dtype=next(self.parameters()).dtype
+        # )  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         head_mask = [None] * self.adapter_config.num_hidden_layers
@@ -136,6 +138,7 @@ class Adapter(nn.Module):
         self.add_layer_norm_before = add_layer_norm_before
         self.add_layer_norm_after = add_layer_norm_after
         self.residual_before_ln = residual_before_ln
+        self.non_linearity_name = non_linearity.lower()
 
         # list for all modules of the adapter, passed into nn.Sequential()
         seq_list = []
@@ -161,10 +164,14 @@ class Adapter(nn.Module):
 
         # select non-linearity
         self.non_linearity = Activation_Function_Class(
-            non_linearity.lower(),
+            self.non_linearity_name,
             input_size=self.input_size,
             down_sample=self.down_sample,
         )
+
+        if self.training and self.non_linearity_name == "bert":
+            self.non_linearity.f.train()
+            self.non_linearity.f.encoder.train()
 
         seq_list.append(self.non_linearity)
 
@@ -194,7 +201,7 @@ class Adapter(nn.Module):
 
         up = self.adapter_up(down)
 
-        if self.non_linearity == "bert":
+        if self.non_linearity_name == "bert":
             output = x + up
         else:
             output = up
