@@ -3,15 +3,74 @@ import math
 import torch
 from torch import nn
 
+from .original_bert import BertEncoder
 from .configuration import AdapterFusionConfig
 
 
+class BertActivation(nn.Module):
+
+    def __init__(self, input_size, down_sample):
+        super().__init__()
+
+        self.input_size = input_size
+        self.down_sample = down_sample
+
+        class AdapterConfig:
+            project_hidden_size: int = self.input_size
+            hidden_act: str = "gelu"
+            adapter_size: int = self.down_sample
+            adapter_initializer_range: float = 0.0002
+            is_decoder: bool = False
+            attention_probs_dropout_prob: float= 0.1
+            hidden_dropout_prob: float=0.1
+            hidden_size: int=768
+            initializer_range: float=0.02
+            intermediate_size: int=3072
+            layer_norm_eps: float=1e-05
+            max_position_embeddings: int=514
+            num_attention_heads: int=12
+            num_hidden_layers: int=2 # from K-Adapters paper
+            num_labels: int=2
+            output_attentions: bool=False
+            output_hidden_states: bool=False
+            torchscript: bool=False
+            type_vocab_size: int=1
+            vocab_size: int=50265
+
+        self.adapter_config = AdapterConfig
+        self.encoder = BertEncoder(self.adapter_config)
+
+    def forward(self, x):
+        # From K-Adapters original code
+        input_shape = x.size()[:-1]
+        attention_mask = torch.ones(input_shape, device=torch.device("cpu"))
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+
+        if attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask[:, None, None, :]
+
+        extended_attention_mask = extended_attention_mask.to(
+            dtype=next(self.parameters()).dtype
+        )  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+        head_mask = [None] * self.adapter_config.num_hidden_layers
+        encoder_outputs = self.encoder(x,
+            attention_mask=extended_attention_mask, head_mask=head_mask
+        )
+
+        return encoder_outputs[0]
+
+
+# Added "bert" activation, which is just a regular BERT transformers with the
+# given size in kwargs
 class Activation_Function_Class(nn.Module):
     """
     Implementation of various activation function.
     """
 
-    def __init__(self, hidden_act):
+    def __init__(self, hidden_act, **kwargs):
 
         if hidden_act.lower() == "relu":
             self.f = nn.functional.relu
@@ -40,13 +99,22 @@ class Activation_Function_Class(nn.Module):
 
         super().__init__()
 
+        if hidden_act.lower() == "bert":
+            self.f = BertActivation(**kwargs)
+
     def forward(self, x):
         return self.f(x)
 
 
 # Single Adapter
-
-
+# Added support for skipping specific layers, do it like:
+# When configuring the adapter, put whatever desired reduction factor
+# put the highest possible reduction factor, will divide hidden_size and yield
+# a number below 0.0, which will trigger skip
+# to only work in layers 0 and 11:
+# layers = {"0": 1, "11": 1, "default": 1000}
+# adapter_config = AdapterConfig(
+#   reduction_factor=layers,
 class Adapter(nn.Module):
     """
     Implementation of a single Adapter block.
@@ -84,13 +152,19 @@ class Adapter(nn.Module):
 
         # ensure that the down sample size is at least 1
         if self.down_sample < 1:
+            # skip this layer
             self.down_sample = 1
+            return
 
         # Linear down projection of the input
         seq_list.append(nn.Linear(self.input_size, self.down_sample))
 
         # select non-linearity
-        self.non_linearity = Activation_Function_Class(non_linearity.lower())
+        self.non_linearity = Activation_Function_Class(
+            non_linearity.lower(),
+            input_size=self.input_size,
+            down_sample=self.down_sample,
+        )
 
         seq_list.append(self.non_linearity)
 
@@ -112,11 +186,18 @@ class Adapter(nn.Module):
             self.adapter_up.apply(self.init_bert_weights)
 
     def forward(self, x, residual_input):  # , residual_input=None):
+        if self.down_sample == 1:
+            # skip this layer
+            return x, None, None
+
         down = self.adapter_down(x)
 
         up = self.adapter_up(down)
 
-        output = up
+        if self.non_linearity == "bert":
+            output = x + up
+        else:
+            output = up
 
         # apply residual connection before layer norm if configured in this way
         if self.residual_before_ln:
@@ -147,7 +228,6 @@ class Adapter(nn.Module):
 
 
 # Adapter Fusion
-
 
 class BertFusion(nn.Module):
     """
