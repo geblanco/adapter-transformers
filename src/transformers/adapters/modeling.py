@@ -23,7 +23,7 @@ class BertActivation(nn.Module):
             is_decoder: bool = False
             attention_probs_dropout_prob: float= 0.1
             hidden_dropout_prob: float=0.1
-            hidden_size: int=768
+            hidden_size: int=self.down_sample
             initializer_range: float=0.02
             intermediate_size: int=3072
             layer_norm_eps: float=1e-05
@@ -153,6 +153,7 @@ class Adapter(nn.Module):
         if down_sample is None:
             self.down_sample = self.input_size // 2
 
+        self.down_sample = int(down_sample)
         # ensure that the down sample size is at least 1
         if self.down_sample < 1:
             # skip this layer
